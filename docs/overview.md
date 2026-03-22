@@ -88,7 +88,8 @@ Train a Korean Visual Document Retrieval (VDR) model that surpasses [jinaai/jina
 | Run | Model | V1 Avg | V2 Avg | Notes |
 |-----|-------|--------|--------|-------|
 | [Run1](run1_report.md) | colgemma3-ko-vdr-v0.3 | 0.2932 | 0.1850 | Baseline |
-| [Run2](run2_report.md) | colgemma3-ko-vdr-0.4 | 0.5023 | 0.2785 | Epoch 1→3, public data v0.1→v1.0 |
+| [Run2](run2_report.md) | colgemma3-ko-vdr-0.4 | 0.5023 | 0.2785 | Epoch 1→3 |
+| [Run3](run3_report.md) | colgemma3-ko-vdr-v0.5 | 0.4249 | 0.2390 | Vision encoder LoRA 제외, custom_text_proj LoRA 추가 |
 
 ## Next Steps
 
