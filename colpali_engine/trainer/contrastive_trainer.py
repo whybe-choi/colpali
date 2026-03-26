@@ -182,6 +182,10 @@ class ContrastiveTrainer(Trainer):
         return neg_doc_outputs
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if hasattr(self.loss_func, "gradcache_enabled") and self.loss_func.gradcache_enabled:
+            loss = self.loss_func(model, inputs)
+            return (loss, None) if return_outputs else loss
+
         query_inputs = {k[len(self.query_prefix) :]: v for k, v in inputs.items() if k.startswith(self.query_prefix)}
         query_outputs = model(**query_inputs)
         # feed only kwargs with 'doc_' prefix
@@ -213,6 +217,10 @@ class ContrastiveTrainer(Trainer):
             raise ValueError("prediction_step is only called with prediction_loss_only=True")
 
         with torch.no_grad():
+            if hasattr(self.loss_func, "gradcache_enabled") and self.loss_func.gradcache_enabled:
+                loss = self.loss_func(model, inputs)
+                return loss, None, None
+
             # feed only kwargs with 'doc_' prefix
             doc_outputs = model(**{k[4:]: v for k, v in inputs.items() if k.startswith("doc")})
             query_outputs = model(input_ids=inputs["query_input_ids"], attention_mask=inputs["query_attention_mask"])
