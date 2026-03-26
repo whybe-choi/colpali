@@ -2,9 +2,15 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F  # noqa: N812
 import tqdm
+from torch.distributed.nn.functional import all_gather
 from torch.utils.checkpoint import get_device_states, set_device_states
+
+from colpali_engine.loss.late_interaction_losses import (
+    ColbertLoss,
+    ColbertPairwiseCELoss,
+    ColbertPairwiseNegativeCELoss,
+)
 
 
 class RandContext:
@@ -33,6 +39,33 @@ class RandContext:
         self._fork = None
 
 
+def _is_distributed() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _gather_doc_embeddings(doc_embeddings: torch.Tensor, local_batch_size: int) -> tuple[torch.Tensor, int]:
+    if not _is_distributed():
+        return doc_embeddings, 0
+
+    gathered_doc_embeddings = torch.cat(all_gather(doc_embeddings), dim=0)
+    offset = torch.distributed.get_rank() * local_batch_size
+    return gathered_doc_embeddings, offset
+
+
+def _flatten_negative_inputs(neg_doc_features: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], int]:
+    if not neg_doc_features:
+        return neg_doc_features, 0
+
+    input_ids = neg_doc_features["input_ids"]
+    num_neg_docs = input_ids.size(1)
+    flattened_features = {key: value.reshape(-1, *value.shape[2:]) for key, value in neg_doc_features.items()}
+    return flattened_features, num_neg_docs
+
+
+def _reshape_negative_embeddings(neg_doc_embeddings: torch.Tensor, num_neg_docs: int) -> torch.Tensor:
+    if num_neg_docs <= 0:
+        raise ValueError("num_neg_docs must be positive when reshaping negative embeddings")
+    return neg_doc_embeddings.reshape(-1, num_neg_docs, *neg_doc_embeddings.shape[1:])
 
 def _backward_hook(grad_output, sentence_features, random_states, loss_obj, model):
     """
@@ -42,7 +75,7 @@ def _backward_hook(grad_output, sentence_features, random_states, loss_obj, mode
     """
     mini_batch_size = loss_obj.mini_batch_size
     # sentence_features: a list with two dicts [query_features, doc_features]
-    # random_states: a list with two lists of RandContext objects.1
+    # random_states: a list with one RandContext list per feature branch.
     assert loss_obj.cache is not None
     assert random_states is not None
     with torch.enable_grad():
@@ -60,7 +93,6 @@ def _backward_hook(grad_output, sentence_features, random_states, loss_obj, mode
                         mini_embeds = model.forward(**mini_feature)
                 else:
                     mini_embeds = model.forward(**mini_feature)
-                # mini_embeds = mini_embeds.detach().requires_grad_(True)
                 cached_grad = branch_cache[idx]
                 # Compute a surrogate loss that replays the cached gradient.
                 surrogate = torch.dot(mini_embeds.flatten(), cached_grad.flatten()) * grad_output
@@ -68,7 +100,21 @@ def _backward_hook(grad_output, sentence_features, random_states, loss_obj, mode
 
 
 class GradCacheColbertLoss(nn.Module):
-    def __init__(self, mini_batch_size: int = 32, scale: float = 1.0, show_progress_bar: bool = False):
+    def __init__(
+        self,
+        mini_batch_size: int = 32,
+        scale: float = 1.0,
+        show_progress_bar: bool = False,
+        temperature: float | None = None,
+        normalize_scores: bool = True,
+        use_smooth_max: bool = False,
+        pos_aware_negative_filtering: bool = False,
+        max_batch_size: int = 1024,
+        tau: float = 0.1,
+        norm_tol: float = 1e-3,
+        filter_threshold: float = 0.95,
+        filter_factor: float = 0.5,
+    ):
         """
         GradCache enabled version of the ColBERT loss.
 
@@ -79,12 +125,21 @@ class GradCacheColbertLoss(nn.Module):
         """
         super().__init__()
         self.mini_batch_size = mini_batch_size
-        self.scale = scale
-        self.ce_loss = nn.CrossEntropyLoss()
         self.cache = None
         self.random_states = None
         self.show_progress_bar = show_progress_bar
         self.gradcache_enabled = True  # Flag indicating GradCache is active.
+        self.inner_loss = ColbertLoss(
+            temperature=1 / scale if temperature is None else temperature,
+            normalize_scores=normalize_scores,
+            use_smooth_max=use_smooth_max,
+            pos_aware_negative_filtering=pos_aware_negative_filtering,
+            max_batch_size=max_batch_size,
+            tau=tau,
+            norm_tol=norm_tol,
+            filter_threshold=filter_threshold,
+            filter_factor=filter_factor,
+        )
 
     def embed_minibatch_iter(self, model, sentence_feature: dict, with_grad: bool, copy_random_state: bool):
         input_ids = sentence_feature["input_ids"]
@@ -99,21 +154,21 @@ class GradCacheColbertLoss(nn.Module):
             grad_context = torch.enable_grad() if with_grad else torch.no_grad()
             with grad_context:
                 mini_embeds = model.forward(**mini_feature)
-                mini_embeds = mini_embeds.detach().requires_grad_(True) # is this the key ?
+                mini_embeds = mini_embeds.detach().requires_grad_(True)
             yield mini_embeds, random_state
 
     def calculate_loss(self, reps: list[list[torch.Tensor]], with_backward: bool = False) -> torch.Tensor:
-        """
-        Calculate the ColBERT-style loss.
-        reps: list with two elements – reps[0] for query embeddings, reps[1] for doc embeddings.
-        Each element is a list of mini-batch tensors.
-        """
         embeddings_query = torch.cat(reps[0], dim=0)  # shape: (total_query, seq_len, dim)
-        embeddings_doc = torch.cat(reps[1], dim=0)  # shape: (total_doc, seq_len, dim)
-        scores = torch.einsum("bnd,csd->bcns", embeddings_query, embeddings_doc).max(dim=3)[0].sum(dim=2)
-        batch_size = scores.size(0)
-        labels = torch.arange(batch_size, device=scores.device)
-        loss = self.ce_loss(scores * self.scale, labels)
+        embeddings_doc = torch.cat(reps[1], dim=0)  # shape: (local_doc_batch, seq_len, dim)
+        gathered_doc_embeddings, offset = _gather_doc_embeddings(
+            embeddings_doc,
+            local_batch_size=embeddings_query.size(0),
+        )
+        loss = self.inner_loss(
+            query_embeddings=embeddings_query,
+            doc_embeddings=gathered_doc_embeddings,
+            offset=offset,
+        )
         if with_backward:
             loss.backward()
         return loss
@@ -162,22 +217,42 @@ class GradCacheColbertLoss(nn.Module):
         else:
             loss = self.calculate_loss(reps, with_backward=False)
         return loss
-
-
-
 class GradCacheColbertPairwiseCELoss(nn.Module):
-    def __init__(self, mini_batch_size: int = 32, scale: float = 1.0, show_progress_bar: bool = False):
+    def __init__(
+        self,
+        mini_batch_size: int = 32,
+        scale: float = 1.0,
+        show_progress_bar: bool = False,
+        temperature: float | None = None,
+        normalize_scores: bool = True,
+        use_smooth_max: bool = False,
+        pos_aware_negative_filtering: bool = False,
+        max_batch_size: int = 1024,
+        tau: float = 0.1,
+        norm_tol: float = 1e-3,
+        filter_threshold: float = 0.95,
+        filter_factor: float = 0.5,
+    ):
         """
         GradCache-enabled version of the ColBERTPairwiseCELoss.
         """
         super().__init__()
         self.mini_batch_size = mini_batch_size
-        self.scale = scale
-        self.ce_loss = nn.CrossEntropyLoss()
         self.cache = None
         self.random_states = None
         self.show_progress_bar = show_progress_bar
         self.gradcache_enabled = True
+        self.inner_loss = ColbertPairwiseCELoss(
+            temperature=1 / scale if temperature is None else temperature,
+            normalize_scores=normalize_scores,
+            use_smooth_max=use_smooth_max,
+            pos_aware_negative_filtering=pos_aware_negative_filtering,
+            max_batch_size=max_batch_size,
+            tau=tau,
+            norm_tol=norm_tol,
+            filter_threshold=filter_threshold,
+            filter_factor=filter_factor,
+        )
 
     def embed_minibatch_iter(self, model, sentence_feature: dict, with_grad: bool, copy_random_state: bool):
         input_ids = sentence_feature["input_ids"]
@@ -193,75 +268,18 @@ class GradCacheColbertPairwiseCELoss(nn.Module):
                 mini_embeds = mini_embeds.detach().requires_grad_(True)
             yield mini_embeds, random_state
 
-    # def calculate_loss(self, reps: list[list[torch.Tensor]], with_backward: bool = False) -> torch.Tensor:
-    #     """
-    #     Compute the ColBERTPairwiseCELoss using cached embeddings.
-    #     reps is a list with two elements: reps[0] for query embeddings and reps[1] for doc embeddings.
-    #     """
-    #     embeddings_query = torch.cat(reps[0], dim=0)  # shape: (batch, num_query_tokens, dim)
-    #     embeddings_doc = torch.cat(reps[1], dim=0)
-    #     # shape: (batch, num_doc_tokens, dim)
-    #     print(f"embeddings_query.shape: {embeddings_query.shape}; embeddings_doc.shape: {embeddings_doc.shape}")
-    #     # breakpoint()
-    #     scores = torch.einsum("bnd,csd->bcns", embeddings_query, embeddings_doc) \
-    #                 .max(dim=3)[0].sum(dim=2)  # (batch, batch)
-    #     pos_scores = scores.diagonal()
-    #     neg_scores = scores - torch.eye(scores.shape[0], device=scores.device) * 1e6
-    #     neg_scores = neg_scores.max(dim=1)[0]
-    #     loss = F.softplus(neg_scores - pos_scores).mean()
-    #     if with_backward:
-    #         loss.backward()
-    #     return loss
-
     def calculate_loss(self, reps: list[list[torch.Tensor]], with_backward: bool = False) -> torch.Tensor:
-        """
-        Compute the ColBERTPairwiseCELoss using cached embeddings without concatenating query embeddings.
-        reps[0] contains query embedding chunks (each of shape: (chunk_size, num_query_tokens, dim)),
-        while reps[1] contains doc embeddings, which we concatenate.
-
-        For each query chunk, we:
-          - Compute scores with all docs using an einsum.
-          - Reduce the scores by taking a max over the doc tokens and summing over query tokens.
-          - Extract the positive score for each query based on its overall index (assuming query i matches doc i).
-          - Mask out the positive score and take the max over negatives.
-          - Compute the softplus loss over the difference (neg_score - pos_score).
-
-        The overall loss is the average over all queries, and remains differentiable.
-        """
-        # Concatenate document embeddings (shape: (total_docs, num_doc_tokens, dim))
+        embeddings_query = torch.cat(reps[0], dim=0)
         embeddings_doc = torch.cat(reps[1], dim=0)
-
-        total_loss = 0.0
-        total_queries = 0
-        global_index = 0  # Tracks the overall index for positive pairing
-
-        # Loop over query chunks
-        for query_chunk in reps[0]:
-            chunk_size = query_chunk.size(0)
-            # print(f"Shape of query chunk: {query_chunk.shape}, Shape of embeddings doc: {embeddings_doc.shape}")
-            # Compute pairwise scores:
-            # Resulting shape: (chunk_size, total_docs, num_query_tokens, num_doc_tokens)
-            scores_chunk = torch.einsum("bnd,csd->bcns", query_chunk, embeddings_doc)
-            # Reduce: max over document tokens then sum over query tokens -> shape: (chunk_size, total_docs)
-            scores_chunk = scores_chunk.max(dim=3)[0].sum(dim=2)
-
-            # For each query in the chunk, the positive doc index is global_index + local_index
-            row_idx = torch.arange(chunk_size, device=scores_chunk.device)
-            pos_idx = torch.arange(global_index, global_index + chunk_size, device=scores_chunk.device)
-            pos_scores = scores_chunk[row_idx, pos_idx]
-
-            # Mask out the positive scores by setting them to a very low value, then take the max over negatives
-            # scores_masked = scores_chunk.clone()
-            scores_chunk[row_idx, pos_idx] = -1e6
-            neg_scores = scores_chunk.max(dim=1)[0]
-
-            # Compute loss for this chunk (sum over the chunk's queries)
-            chunk_loss = F.softplus(neg_scores - pos_scores).sum()
-            total_loss += chunk_loss
-            total_queries += chunk_size
-            global_index += chunk_size
-
-        loss = total_loss / total_queries
+        gathered_doc_embeddings, offset = _gather_doc_embeddings(
+            embeddings_doc,
+            local_batch_size=embeddings_query.size(0),
+        )
+        loss = self.inner_loss(
+            query_embeddings=embeddings_query,
+            doc_embeddings=gathered_doc_embeddings,
+            offset=offset,
+        )
         if with_backward:
             loss.backward()
         return loss
@@ -295,18 +313,36 @@ class GradCacheColbertPairwiseCELoss(nn.Module):
 
         if torch.is_grad_enabled():
             loss = self.calculate_loss_and_cache_gradients(reps)
-            loss.register_hook(partial(_backward_hook,
-                                         sentence_features=[query_features, doc_features],
-                                         random_states=self.random_states,
-                                         loss_obj=self, model=model))
+            loss.register_hook(
+                partial(
+                    _backward_hook,
+                    sentence_features=[query_features, doc_features],
+                    random_states=self.random_states,
+                    loss_obj=self,
+                    model=model,
+                )
+            )
         else:
             loss = self.calculate_loss(reps, with_backward=False)
         return loss
 
-
-
 class GradCacheColbertPairwiseNegativeCELoss(nn.Module):
-    def __init__(self, mini_batch_size: int = 32, in_batch_term: bool = False, show_progress_bar: bool = False):
+    def __init__(
+        self,
+        mini_batch_size: int = 32,
+        in_batch_term: bool = False,
+        show_progress_bar: bool = False,
+        temperature: float = 0.02,
+        normalize_scores: bool = True,
+        use_smooth_max: bool = False,
+        pos_aware_negative_filtering: bool = False,
+        in_batch_term_weight: float | None = None,
+        max_batch_size: int = 1024,
+        tau: float = 0.1,
+        norm_tol: float = 1e-3,
+        filter_threshold: float = 0.95,
+        filter_factor: float = 0.5,
+    ):
         """
         GradCache-enabled version of the ColBERTPairwiseNegativeCELoss.
 
@@ -315,11 +351,25 @@ class GradCacheColbertPairwiseNegativeCELoss(nn.Module):
         """
         super().__init__()
         self.mini_batch_size = mini_batch_size
-        self.in_batch_term = in_batch_term
         self.cache = None
         self.random_states = None
         self.show_progress_bar = show_progress_bar
         self.gradcache_enabled = True
+        self.num_neg_docs = 0
+        self.inner_loss = ColbertPairwiseNegativeCELoss(
+            temperature=temperature,
+            normalize_scores=normalize_scores,
+            use_smooth_max=use_smooth_max,
+            pos_aware_negative_filtering=pos_aware_negative_filtering,
+            in_batch_term_weight=0.5 if in_batch_term_weight is None and in_batch_term else (
+                0.0 if in_batch_term_weight is None else in_batch_term_weight
+            ),
+            max_batch_size=max_batch_size,
+            tau=tau,
+            norm_tol=norm_tol,
+            filter_threshold=filter_threshold,
+            filter_factor=filter_factor,
+        )
 
     def embed_minibatch_iter(self, model, sentence_feature: dict, with_grad: bool, copy_random_state: bool):
         input_ids = sentence_feature["input_ids"]
@@ -336,33 +386,22 @@ class GradCacheColbertPairwiseNegativeCELoss(nn.Module):
             yield mini_embeds, random_state
 
     def calculate_loss(self, reps: list[list[torch.Tensor]], with_backward: bool = False) -> torch.Tensor:
-        """
-        Compute the ColBERTPairwiseNegativeCELoss.
-        reps is a list with three elements:
-          reps[0]: query embeddings,
-          reps[1]: positive doc embeddings,
-          reps[2]: negative doc embeddings.
-        """
         embeddings_query = torch.cat(reps[0], dim=0)  # (batch, num_query_tokens, dim)
-        embeddings_doc = torch.cat(reps[1], dim=0)  # (batch, num_doc_tokens, dim)
-        embeddings_neg_doc = torch.cat(reps[2], dim=0)  # (batch, num_neg_doc_tokens, dim)
-
-        # Compute scores for positive and negative documents.
-        pos_scores = torch.einsum("bnd,bsd->bns", embeddings_query, embeddings_doc) \
-            .max(dim=2)[0].sum(dim=1)
-        neg_scores = torch.einsum("bnd,bsd->bns", embeddings_query, embeddings_neg_doc) \
-            .max(dim=2)[0].sum(dim=1)
-        loss = F.softplus(neg_scores - pos_scores).mean()
-
-        if self.in_batch_term:
-            scores = torch.einsum("bnd,csd->bcns", embeddings_query, embeddings_doc) \
-                .max(dim=3)[0].sum(dim=2)
-            pos_scores_in = scores.diagonal()
-            neg_scores_in = scores - torch.eye(scores.shape[0], device=scores.device) * 1e6
-            neg_scores_in = neg_scores_in.max(dim=1)[0]
-            loss_in = F.softplus(neg_scores_in - pos_scores_in).mean()
-            loss = (loss + loss_in) / 2
-
+        embeddings_doc = torch.cat(reps[1], dim=0)  # (local batch, num_doc_tokens, dim)
+        embeddings_neg_doc = _reshape_negative_embeddings(
+            torch.cat(reps[2], dim=0),
+            num_neg_docs=self.num_neg_docs,
+        )
+        gathered_doc_embeddings, offset = _gather_doc_embeddings(
+            embeddings_doc,
+            local_batch_size=embeddings_query.size(0),
+        )
+        loss = self.inner_loss(
+            query_embeddings=embeddings_query,
+            doc_embeddings=gathered_doc_embeddings,
+            neg_doc_embeddings=embeddings_neg_doc,
+            offset=offset,
+        )
         if with_backward:
             loss.backward()
         return loss
@@ -381,6 +420,7 @@ class GradCacheColbertPairwiseNegativeCELoss(nn.Module):
         query_features = {k.replace("query_", ""): v for k, v in inputs.items() if k.startswith("query_")}
         doc_features = {k.replace("doc_", ""): v for k, v in inputs.items() if k.startswith("doc_")}
         neg_doc_features = {k.replace("neg_doc_", ""): v for k, v in inputs.items() if k.startswith("neg_doc_")}
+        neg_doc_features, self.num_neg_docs = _flatten_negative_inputs(neg_doc_features)
 
         # First pass: get embeddings without gradients and capture RandContext.
         reps_query, rs_query = [], []

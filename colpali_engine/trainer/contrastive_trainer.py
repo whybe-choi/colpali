@@ -52,6 +52,9 @@ class ContrastiveTrainer(Trainer):
         self.train_dataset_list = train_dataset_list
         self.eval_dataset_list = eval_dataset_list
         self.compute_symetric_loss = compute_symetric_loss
+        self.query_prefix = self.data_collator.query_prefix
+        self.pos_prefix = self.data_collator.pos_doc_prefix
+        self.neg_prefix = self.data_collator.neg_doc_prefix
 
     def get_train_dataloader(self) -> DataLoader:
         """
@@ -80,10 +83,6 @@ class ContrastiveTrainer(Trainer):
             dataset = self._remove_unused_columns(dataset, description=description)
         else:
             data_collator = self._get_collator_with_removed_columns(self.data_collator, description=description)
-
-        self.query_prefix = data_collator.query_prefix
-        self.pos_prefix = data_collator.pos_doc_prefix
-        self.neg_prefix = data_collator.neg_doc_prefix
 
         dataloader_params = {
             ######### don't set batch size, mutually exclusive from batch sampler ######
@@ -116,9 +115,9 @@ class ContrastiveTrainer(Trainer):
 
         return self.accelerator.prepare(dataloader)
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+    def _get_train_sampler(self, train_dataset=None) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset_list is None:
-            return super()._get_train_sampler()
+            return super()._get_train_sampler(train_dataset)
 
         # Use SingleDatasetBatchSampler to ensure that each dataset in the list is sampled independently
         # Note: Surely breaks in distributed training
@@ -183,6 +182,8 @@ class ContrastiveTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if hasattr(self.loss_func, "gradcache_enabled") and self.loss_func.gradcache_enabled:
+            if self.compute_symetric_loss:
+                raise ValueError("GradCache losses do not support compute_symetric_loss.")
             loss = self.loss_func(model, inputs)
             return (loss, None) if return_outputs else loss
 
