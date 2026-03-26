@@ -313,6 +313,19 @@ accelerate launch --multi-gpu scripts/configs/qwen2/train_colqwen25_model.py
 </details>
 
 <details>
+<summary><strong>🔽 Example 1b: Local GradCache training</strong></summary>
+
+```bash
+accelerate launch --multi-gpu scripts/configs/qwen2/train_colqwen2_gradcache_model.yaml
+```
+
+- GradCache late-interaction support covers standard, pairwise, and pairwise-negative losses.
+- `mini_batch_size` controls the GradCache chunk size; lower values reduce peak memory at the cost of throughput.
+- `compute_symetric_loss=True` is not supported with GradCache.
+
+</details>
+
+<details>
 <summary><strong>🔽 Example 2: Training on a SLURM cluster</strong></summary>
 
 ```bash
@@ -333,10 +346,29 @@ To contribute to ColPali, first install the development dependencies for proper 
 pip install "colpali-engine[dev]"
 ```
 
+If you use `uv`, the equivalent local environment setup is:
+
+```bash
+uv venv
+uv pip install --python .venv/bin/python -e '.[dev,train]'
+```
+
 To run all the tests, you will have to install all optional dependencies (or you'll get an error in test discovery):
 
 ```bash
 pip install "colpali-engine[all]"
+```
+
+Focused GradCache checks can be run with:
+
+```bash
+pytest -q tests/loss/test_li_losses.py tests/loss/test_gradcache_distributed.py tests/trainer/test_contrastive_trainer_gradcache.py
+```
+
+With the `uv`-managed environment above, use:
+
+```bash
+.venv/bin/python -m pytest -q tests/loss/test_li_losses.py tests/loss/test_gradcache_distributed.py tests/trainer/test_contrastive_trainer_gradcache.py
 ```
 
 When your PR is ready, ping one of the repository maintainers. We will do our best to review it as soon as possible!

@@ -9,6 +9,9 @@ from colpali_engine.loss import (
     ColbertNegativeCELoss,
     ColbertPairwiseCELoss,
     ColbertPairwiseNegativeCELoss,
+    GradCacheColbertLoss,
+    GradCacheColbertPairwiseCELoss,
+    GradCacheColbertPairwiseNegativeCELoss,
 )
 
 
@@ -179,3 +182,198 @@ class TestColbertPairwiseNegativeCELoss:
         loss = loss_fn(query, doc, neg)
         expected = F.softplus(torch.tensor(0.0))
         assert torch.allclose(loss, expected)
+
+
+class _ToyTokenModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, input_ids, attention_mask=None):
+        x = input_ids.float().unsqueeze(-1)
+        basis = torch.tensor([1.0, -0.5, 0.75, 1.25], dtype=torch.float32).view(1, 1, 4)
+        pos = torch.arange(input_ids.shape[1], dtype=torch.float32).view(1, -1, 1) + 1.0
+        return (x + pos * 0.2) * basis * self.weight
+
+
+def _run_gradcache_loss(loss_fn, model, query_ids, doc_ids):
+    inputs = {
+        "query_input_ids": query_ids,
+        "query_attention_mask": (query_ids != 0).long(),
+        "doc_input_ids": doc_ids,
+        "doc_attention_mask": (doc_ids != 0).long(),
+    }
+    loss = loss_fn(model, inputs)
+    loss.backward()
+    return loss.detach(), model.weight.grad.detach().clone()
+
+
+def _run_gradcache_negative_loss(loss_fn, model, query_ids, doc_ids, neg_doc_ids):
+    inputs = {
+        "query_input_ids": query_ids,
+        "query_attention_mask": (query_ids != 0).long(),
+        "doc_input_ids": doc_ids,
+        "doc_attention_mask": (doc_ids != 0).long(),
+        "neg_doc_input_ids": neg_doc_ids,
+        "neg_doc_attention_mask": (neg_doc_ids != 0).long(),
+    }
+    loss = loss_fn(model, inputs)
+    loss.backward()
+    return loss.detach(), model.weight.grad.detach().clone()
+
+
+def _run_standard_loss(loss_fn, model, query_ids, doc_ids):
+    query_embeddings = model(query_ids)
+    doc_embeddings = model(doc_ids)
+    loss = loss_fn(query_embeddings, doc_embeddings)
+    loss.backward()
+    return loss.detach(), model.weight.grad.detach().clone()
+
+
+def _run_standard_negative_loss(loss_fn, model, query_ids, doc_ids, neg_doc_ids):
+    query_embeddings = model(query_ids)
+    doc_embeddings = model(doc_ids)
+    neg_doc_embeddings = model(neg_doc_ids.view(-1, neg_doc_ids.shape[-1])).view(
+        neg_doc_ids.size(0), neg_doc_ids.size(1), neg_doc_ids.size(2), -1
+    )
+    loss = loss_fn(query_embeddings, doc_embeddings, neg_doc_embeddings)
+    loss.backward()
+    return loss.detach(), model.weight.grad.detach().clone()
+
+
+def _assert_loss_and_grad_equivalent(standard_loss_fn, gradcache_loss_fn, query_ids, doc_ids):
+    standard_model = _ToyTokenModel()
+    gradcache_model = _ToyTokenModel()
+    gradcache_model.load_state_dict(standard_model.state_dict())
+
+    standard_loss, standard_grad = _run_standard_loss(standard_loss_fn, standard_model, query_ids, doc_ids)
+    gradcache_loss, gradcache_grad = _run_gradcache_loss(gradcache_loss_fn, gradcache_model, query_ids, doc_ids)
+
+    assert torch.allclose(standard_loss, gradcache_loss, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(standard_grad, gradcache_grad, atol=1e-5, rtol=1e-5)
+
+
+def _assert_negative_loss_and_grad_equivalent(standard_loss_fn, gradcache_loss_fn, query_ids, doc_ids, neg_doc_ids):
+    standard_model = _ToyTokenModel()
+    gradcache_model = _ToyTokenModel()
+    gradcache_model.load_state_dict(standard_model.state_dict())
+
+    standard_loss, standard_grad = _run_standard_negative_loss(
+        standard_loss_fn,
+        standard_model,
+        query_ids,
+        doc_ids,
+        neg_doc_ids,
+    )
+    gradcache_loss, gradcache_grad = _run_gradcache_negative_loss(
+        gradcache_loss_fn,
+        gradcache_model,
+        query_ids,
+        doc_ids,
+        neg_doc_ids,
+    )
+
+    assert torch.allclose(standard_loss, gradcache_loss, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(standard_grad, gradcache_grad, atol=1e-5, rtol=1e-5)
+
+
+class TestGradCacheEquivalence:
+    @pytest.mark.parametrize("normalize_scores", [True, False])
+    def test_gradcache_pairwise_matches_standard(self, normalize_scores):
+        query_ids = torch.tensor([[1, 3, 0], [2, 1, 4]], dtype=torch.long)
+        doc_ids = torch.tensor([[3, 1, 0], [1, 4, 2]], dtype=torch.long)
+        _assert_loss_and_grad_equivalent(
+            ColbertPairwiseCELoss(temperature=1.0, normalize_scores=normalize_scores),
+            GradCacheColbertPairwiseCELoss(
+                mini_batch_size=1,
+                temperature=1.0,
+                normalize_scores=normalize_scores,
+            ),
+            query_ids,
+            doc_ids,
+        )
+
+    @pytest.mark.parametrize("normalize_scores", [True, False])
+    def test_gradcache_infonce_matches_standard(self, normalize_scores):
+        query_ids = torch.tensor([[1, 2, 0], [3, 1, 4]], dtype=torch.long)
+        doc_ids = torch.tensor([[2, 1, 0], [1, 4, 3]], dtype=torch.long)
+        _assert_loss_and_grad_equivalent(
+            ColbertLoss(temperature=1.0, normalize_scores=normalize_scores),
+            GradCacheColbertLoss(
+                mini_batch_size=1,
+                temperature=1.0,
+                normalize_scores=normalize_scores,
+            ),
+            query_ids,
+            doc_ids,
+        )
+
+    @pytest.mark.parametrize(
+        ("standard_loss_fn", "gradcache_loss_fn"),
+        [
+            (
+                ColbertPairwiseCELoss(temperature=1.0),
+                GradCacheColbertPairwiseCELoss(mini_batch_size=2, temperature=1.0),
+            ),
+            (
+                ColbertLoss(temperature=1.0),
+                GradCacheColbertLoss(mini_batch_size=2, temperature=1.0),
+            ),
+        ],
+    )
+    def test_gradcache_batch_8_minibatch_2_matches_full_batch(self, standard_loss_fn, gradcache_loss_fn):
+        query_ids = torch.tensor(
+            [
+                [1, 3, 0],
+                [2, 1, 4],
+                [4, 1, 2],
+                [3, 0, 0],
+                [5, 2, 1],
+                [1, 1, 1],
+                [2, 4, 0],
+                [3, 2, 5],
+            ],
+            dtype=torch.long,
+        )
+        doc_ids = torch.tensor(
+            [
+                [3, 1, 0],
+                [1, 4, 2],
+                [4, 2, 1],
+                [3, 1, 1],
+                [5, 1, 2],
+                [1, 2, 1],
+                [2, 4, 1],
+                [3, 5, 2],
+            ],
+            dtype=torch.long,
+        )
+        _assert_loss_and_grad_equivalent(standard_loss_fn, gradcache_loss_fn, query_ids, doc_ids)
+
+    @pytest.mark.parametrize("in_batch_term_weight", [0.0, 0.5])
+    def test_gradcache_pairwise_negative_matches_standard(self, in_batch_term_weight):
+        query_ids = torch.tensor([[1, 3, 0], [2, 1, 4]], dtype=torch.long)
+        doc_ids = torch.tensor([[3, 1, 0], [1, 4, 2]], dtype=torch.long)
+        neg_doc_ids = torch.tensor(
+            [
+                [[4, 1, 0], [5, 1, 2]],
+                [[2, 2, 1], [3, 4, 0]],
+            ],
+            dtype=torch.long,
+        )
+        _assert_negative_loss_and_grad_equivalent(
+            ColbertPairwiseNegativeCELoss(
+                temperature=1.0,
+                normalize_scores=False,
+                in_batch_term_weight=in_batch_term_weight,
+            ),
+            GradCacheColbertPairwiseNegativeCELoss(
+                mini_batch_size=1,
+                temperature=1.0,
+                normalize_scores=False,
+                in_batch_term_weight=in_batch_term_weight,
+            ),
+            query_ids,
+            doc_ids,
+            neg_doc_ids,
+        )
