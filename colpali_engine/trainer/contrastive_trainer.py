@@ -184,6 +184,10 @@ class ContrastiveTrainer(Trainer):
         if hasattr(self.loss_func, "gradcache_enabled") and self.loss_func.gradcache_enabled:
             if self.compute_symetric_loss:
                 raise ValueError("GradCache losses do not support compute_symetric_loss.")
+            if hasattr(self.loss_func, "gather_across_processes"):
+                self.loss_func.gather_across_processes = self.accelerator.num_processes > 1 and bool(
+                    self.accelerator.sync_gradients
+                )
             loss = self.loss_func(model, inputs)
             return (loss, None) if return_outputs else loss
 

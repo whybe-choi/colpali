@@ -1,6 +1,7 @@
 import pytest
 import torch
 from transformers import TrainingArguments
+from types import SimpleNamespace
 
 from colpali_engine.loss import ColbertPairwiseCELoss, GradCacheColbertPairwiseCELoss
 from colpali_engine.trainer.contrastive_trainer import ContrastiveTrainer
@@ -129,3 +130,52 @@ def test_standard_compute_loss_uses_prefixes_without_dataloader_side_effects(tmp
     loss = trainer.compute_loss(trainer.model, inputs)
 
     assert loss.ndim == 0
+
+
+class _SpyGradCacheLoss(GradCacheColbertPairwiseCELoss):
+    def __init__(self):
+        super().__init__(mini_batch_size=1, temperature=1.0, normalize_scores=False)
+        self.recorded_gather_flag = None
+
+    def forward(self, model, inputs: dict) -> torch.Tensor:
+        self.recorded_gather_flag = self.gather_across_processes
+        return torch.zeros((), requires_grad=True)
+
+
+@pytest.mark.parametrize(
+    ("num_processes", "sync_gradients", "expected_gather"),
+    [
+        (1, False, False),
+        (2, False, False),
+        (2, True, True),
+    ],
+)
+def test_gradcache_matches_standard_gather_semantics(tmp_path, num_processes, sync_gradients, expected_gather):
+    loss_func = _SpyGradCacheLoss()
+    trainer = ContrastiveTrainer(
+        model=_ToyModel(),
+        train_dataset=_DummyTrainDataset(),
+        eval_dataset=None,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            per_device_train_batch_size=2,
+            report_to=[],
+            use_cpu=True,
+            remove_unused_columns=False,
+        ),
+        data_collator=_DummyCollator(),
+        loss_func=loss_func,
+        is_vision_model=False,
+    )
+    trainer.accelerator = SimpleNamespace(num_processes=num_processes, sync_gradients=sync_gradients)
+
+    inputs = {
+        "query_input_ids": torch.tensor([[1, 3, 0], [2, 1, 4]], dtype=torch.long),
+        "query_attention_mask": torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.long),
+        "doc_input_ids": torch.tensor([[3, 1, 0], [1, 4, 2]], dtype=torch.long),
+        "doc_attention_mask": torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.long),
+    }
+
+    trainer.compute_loss(trainer.model, inputs)
+
+    assert loss_func.recorded_gather_flag is expected_gather
