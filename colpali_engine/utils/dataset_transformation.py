@@ -9,6 +9,24 @@ from colpali_engine.data.dataset import ColPaliEngineDataset, Corpus
 USE_LOCAL_DATASET = os.environ.get("USE_LOCAL_DATASET", "1") == "1"
 
 
+def load_hf_datasets(
+    dataset_names: List[str],
+    split: str = "train",
+    query_column_name: str = "query",
+    pos_target_column_name: str = "pos",
+) -> ColPaliEngineDataset:
+    """Load one or more HuggingFace datasets and return a concatenated ColPaliEngineDataset."""
+    datasets = [
+        cast(Dataset, load_dataset(name, split=split)).select_columns([query_column_name, pos_target_column_name])
+        for name in dataset_names
+    ]
+    combined = concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
+    combined = combined.shuffle(seed=42)
+    return ColPaliEngineDataset(
+        combined, query_column_name=query_column_name, pos_target_column_name=pos_target_column_name
+    )
+
+
 def load_train_set() -> ColPaliEngineDataset:
     base_path = "./data_dir/" if USE_LOCAL_DATASET else "vidore/"
     dataset = load_dataset(base_path + "colpali_train_set", split="train")
