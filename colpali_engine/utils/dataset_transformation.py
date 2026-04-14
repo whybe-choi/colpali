@@ -9,6 +9,60 @@ from colpali_engine.data.dataset import ColPaliEngineDataset, Corpus
 USE_LOCAL_DATASET = os.environ.get("USE_LOCAL_DATASET", "1") == "1"
 
 
+def load_multi_dataset(
+    query_column_name: str = "query",
+    pos_target_column_name: str = "pos",
+) -> Dataset:
+    """Load all 8 training datasets and concatenate (NO shuffle — indices must match hardnegs)."""
+    datasets: List[Dataset] = []
+
+    # 1. ColPali train set (127K pairs)
+    print("Loading: vidore/colpali_train_set...")
+    ds = cast(Dataset, load_dataset("vidore/colpali_train_set", split="train", num_proc=16))
+    ds = ds.select_columns([query_column_name, pos_target_column_name])
+    datasets.append(ds)
+    print(f"  -> {len(ds)} pairs")
+
+    # 2. VisRAG synthetic data (239K pairs)
+    print("Loading: openbmb/VisRAG-Ret-Train-Synthetic-data...")
+    ds = cast(Dataset, load_dataset("openbmb/VisRAG-Ret-Train-Synthetic-data", split="train", num_proc=16))
+    ds = ds.select_columns([query_column_name, pos_target_column_name])
+    datasets.append(ds)
+    print(f"  -> {len(ds)} pairs")
+
+    # 3. VisRAG in-domain data (123K pairs)
+    print("Loading: openbmb/VisRAG-Ret-Train-In-domain-data...")
+    ds = cast(Dataset, load_dataset("openbmb/VisRAG-Ret-Train-In-domain-data", split="train", num_proc=16))
+    ds = ds.select_columns([query_column_name, pos_target_column_name])
+    datasets.append(ds)
+    print(f"  -> {len(ds)} pairs")
+
+    # 4. VDR multilingual (5 languages)
+    for lang in ["en", "de", "es", "fr", "it"]:
+        print(f"Loading: llamaindex/vdr-multilingual-train ({lang})...")
+        ds = cast(
+            Dataset,
+            load_dataset("llamaindex/vdr-multilingual-train", lang, split="train", num_proc=16),
+        )
+        ds = ds.select_columns([query_column_name, pos_target_column_name])
+        before = len(ds)
+        import pyarrow.compute as pc
+
+        query_arr = ds.data.table.column(query_column_name)
+        valid_indices = pc.is_valid(query_arr).to_pylist()
+        ds = ds.select([i for i, v in enumerate(valid_indices) if v])
+        print(f"  -> {len(ds)} pairs (filtered {before - len(ds)} null queries)")
+        datasets.append(ds)
+
+    # Concatenate all — DO NOT shuffle yet (hardneg indices must match)
+    combined = concatenate_datasets(datasets)
+    total = len(combined)
+    print(f"\nTotal training pairs: {total}")
+    return ColPaliEngineDataset(
+        combined, query_column_name=query_column_name, pos_target_column_name=pos_target_column_name
+    )
+
+
 def load_hf_datasets(
     dataset_names: List[str],
     split: str = "train",
@@ -17,7 +71,9 @@ def load_hf_datasets(
 ) -> ColPaliEngineDataset:
     """Load one or more HuggingFace datasets and return a concatenated ColPaliEngineDataset."""
     datasets = [
-        cast(Dataset, load_dataset(name, split=split)).select_columns([query_column_name, pos_target_column_name])
+        cast(Dataset, load_dataset(name, split=split, num_proc=16)).select_columns(
+            [query_column_name, pos_target_column_name]
+        )
         for name in dataset_names
     ]
     combined = concatenate_datasets(datasets) if len(datasets) > 1 else datasets[0]
