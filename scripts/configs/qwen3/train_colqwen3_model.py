@@ -27,7 +27,23 @@ from colpali_engine.loss.late_interaction_losses import ColbertLoss, ColbertPair
 from colpali_engine.models import ColQwen3, ColQwen3Processor
 from colpali_engine.trainer.colmodel_torch_training import ColModelTorchTraining
 from colpali_engine.trainer.colmodel_training import ColModelTraining, ColModelTrainingConfig
-from colpali_engine.utils.dataset_transformation import load_hf_datasets
+from colpali_engine.utils.dataset_transformation import load_hf_datasets, load_multi_dataset
+
+import torch.nn.functional as F
+from transformers.models.qwen3_vl import modeling_qwen3_vl
+
+
+def _patch_embed_forward(self, hidden_states):
+    target_dtype = self.proj.weight.dtype
+    hidden_states = hidden_states.view(
+        -1, self.in_channels * self.temporal_patch_size * self.patch_size * self.patch_size
+    )
+    # Conv3d weight: (embed_dim, in_channels, T, H, W) -> (embed_dim, in_channels*T*H*W)
+    weight = self.proj.weight.view(self.embed_dim, -1)
+    return F.linear(hidden_states.to(target_dtype), weight, self.proj.bias)
+
+
+modeling_qwen3_vl.Qwen3VLVisionPatchEmbed.forward = _patch_embed_forward
 
 
 def parse_args():
@@ -119,9 +135,8 @@ if __name__ == "__main__":
     )
     processor = ColQwen3Processor.from_pretrained(
         pretrained_model_name_or_path=args.model_name_or_path,
+        max_num_visual_tokens=args.max_visual_tokens,
     )
-    if hasattr(processor, "max_num_visual_tokens"):
-        processor.max_num_visual_tokens = args.max_visual_tokens
 
     # --- Prepare training configuration ---
     config = ColModelTrainingConfig(
