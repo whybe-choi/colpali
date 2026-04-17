@@ -9,9 +9,9 @@ Train a Korean Visual Document Retrieval (VDR) model that surpasses [jinaai/jina
 | Benchmark | Current Best Ours (Run9) | jina-embeddings-v4 (3.8B) | TomoroAI (8B) | Gap to Best |
 |-----------|--------------------------|----------------------------|---------------|-------------|
 | KoViDoRe V1 (NDCG@5) | 0.8143 | 0.8650 | 0.7920 | -0.0507 vs jina |
-| KoViDoRe V2 (NDCG@10) | 0.5277 | 0.5500 | 0.4380 | -0.0223 vs jina |
+| KoViDoRe V2 (NDCG@10) | 0.5317 (Run10) | 0.5500 | 0.4380 | -0.0183 vs jina |
 
-Run9 기준으로 V1/V2 모두 현재까지 최고 성능을 달성했다. colqwen2-v1.0(영어 VDR 선행 학습 모델) 위에 한국어 데이터를 fine-tune하는 2-stage 접근이 핵심이었다. V1 평균(0.8143)은 TomoroAI(0.7920)를 처음으로 명확히 앞섰고, V2 평균(0.5277)은 jina와의 Gap이 -0.0223까지 축소됐다.
+V1 최고 성능은 Run9(0.8143)이 유지. V2는 Run10(0.5317)이 소폭 개선으로 새 최고 성능. Run10은 Qwen3-VL-4B 기반으로 Stage 1을 자체 학습한 첫 end-to-end 2-stage 런으로, V2 jina와의 Gap이 -0.0183까지 축소됐다.
 
 ## Performance Targets
 
@@ -33,17 +33,17 @@ Run9 기준으로 V1/V2 모두 현재까지 최고 성능을 달성했다. colqw
 
 ### KoViDoRe V2 Per-Task Breakdown (NDCG@10)
 
-| Task | Current Best Ours (Run9) | jina-embeddings-v4 (3.8B) | TomoroAI (8B) |
-|------|--------------------------|---------------------------|---------------|
-| Cybersecurity | 0.7558 | 0.7760 | 0.7370 |
-| Economic | 0.1831 | 0.2450 | 0.1630 |
-| Energy | 0.6757 | 0.6770 | 0.5850 |
-| HR | 0.4964 | 0.5010 | 0.2650 |
-| **Average** | **0.5277** | **0.5500** | **0.4380** |
+| Task | Current Best Ours (Run10) | jina-embeddings-v4 (3.8B) | TomoroAI (8B) |
+|------|---------------------------|---------------------------|---------------|
+| Cybersecurity | 0.7618 | 0.7760 | 0.7370 |
+| Economic | 0.2286 | 0.2450 | 0.1630 |
+| Energy | 0.6577 | 0.6770 | 0.5850 |
+| HR | 0.4786 | 0.5010 | 0.2650 |
+| **Average** | **0.5317** | **0.5500** | **0.4380** |
 
 ## Technical Foundation
 
-- **Current base model:** vidore/colqwen2-v1.0 (Qwen2-VL-2B-Instruct 기반)
+- **Current base model:** whybe-choi/colqwen3-ko-vdr-base (Qwen3-VL-4B-Instruct 기반, 자체 Stage 1 학습)
 - **Architecture:** VLM + ColBERT late interaction
 - **Loss:** ColBERT cross-entropy with in-batch negatives (`tau=0.02`)
 - **Fine-tuning:** LoRA (`r=32`, `alpha=32`, `dropout=0.05`)
@@ -58,6 +58,7 @@ Run9 기준으로 V1/V2 모두 현재까지 최고 성능을 달성했다. colqw
 - **Run7:** NVIDIA B200 environment with larger batch size and no GradCache
 - **Run8:** 2x NVIDIA B200, ColQwen3 (Qwen3-VL-4B-Instruct) base model
 - **Run9:** 2x NVIDIA B200, 첫 2-stage 학습 (colqwen2-v1.0 → 한국어 fine-tune)
+- **Run10:** 2x NVIDIA B200, 첫 end-to-end 2-stage (Qwen3-VL-4B Stage 1 자체 학습 → 한국어 fine-tune)
 
 ## Training Data
 
@@ -67,6 +68,10 @@ Run9 기준으로 V1/V2 모두 현재까지 최고 성능을 달성했다. colqw
 | whybe-choi/ko-vdr-train-public-v1.0 | Main public dataset for Run4-5 |
 | NomaDamas/ko-vdr-train-public-v2.0 | Expanded public dataset used in Run6-7; includes v1.0 |
 | whybe-choi/ko-vdr-train-private-v0.1 | Private Korean VDR data used in Run1-3 and Run5-7 |
+| vidore/colpali_train_set | Stage 1 multilingual pre-training (Run10) |
+| openbmb/VisRAG-Ret-Train-Synthetic-data | Stage 1 multilingual pre-training (Run10) |
+| openbmb/VisRAG-Ret-Train-In-domain-data | Stage 1 multilingual pre-training (Run10) |
+| llamaindex/vdr-multilingual-train (en/de/es/fr/it) | Stage 1 multilingual pre-training (Run10) |
 
 ## Competitive Gap Analysis
 
@@ -89,14 +94,14 @@ Run9 기준으로 V1/V2 모두 현재까지 최고 성능을 달성했다. colqw
 
 ### Key differences from our current approach
 
-| Aspect | Ours (Run9) | jina-embeddings-v4 | TomoroAI |
-|--------|-------------|---------------------|----------|
-| Base Model | Qwen2-VL 2B (2-stage) | Qwen2.5-VL 3B | Qwen3-VL 8B + Qwen3-Embedding 8B |
+| Aspect | Ours (Run10) | jina-embeddings-v4 | TomoroAI |
+|--------|--------------|---------------------|----------|
+| Base Model | Qwen3-VL 4B (2-stage, self-trained) | Qwen2.5-VL 3B | Qwen3-VL 8B + Qwen3-Embedding 8B |
 | Embedding | Multi-vector only | Single + Multi-vector | Multi-vector (320-dim) |
 | Training stages | 2-stage | 2-stage | Unknown |
 | Loss | ColBERT CE | InfoNCE + KL divergence | ColBERT-style |
 | Text embedding init | None | Unknown | Merged from text embedding model |
-| Training data | English ColPali → Korean public/private | Large-scale multilingual | Multilingual VDR + synthetic |
+| Training data | Multilingual (ColPali+VisRAG+VDR) → Korean public/private | Large-scale multilingual | Multilingual VDR + synthetic |
 
 ## Run History
 
@@ -110,7 +115,8 @@ Run9 기준으로 V1/V2 모두 현재까지 최고 성능을 달성했다. colqw
 | [Run6](run6_report.md) | colgemma3-ko-vdr-v0.8 | 0.6403 | 0.4061 | public v2.0 도입, V2 중심 개선 |
 | [Run7](run7_report.md) | colgemma3-ko-vdr-v0.9 | 0.7115 | 0.4339 | B200 환경, batch 128, GradCache 제거 |
 | [Run8](run8_report.md) | colqwen3-ko-vdr-v0.1 | 0.7811 | 0.4793 | ColQwen3로 베이스 모델 교체 |
-| [Run9](run9_report.md) | colqwen2-ko-vdr-v1.0 | 0.8143 | 0.5277 | 첫 2-stage 학습 (colqwen2-v1.0 → 한국어 fine-tune), 현재 최고 성능 |
+| [Run9](run9_report.md) | colqwen2-ko-vdr-v1.0 | 0.8143 | 0.5277 | 첫 2-stage 학습 (colqwen2-v1.0 → 한국어 fine-tune), V1 현재 최고 성능 |
+| [Run10](run10_report.md) | colqwen3-ko-vdr-v1.0 | 0.7998 | 0.5317 | 첫 end-to-end 2-stage (Qwen3-VL-4B Stage 1 자체 학습), V2 현재 최고 성능 |
 
 ## Trend Summary
 
@@ -119,9 +125,8 @@ Run9 기준으로 V1/V2 모두 현재까지 최고 성능을 달성했다. colqw
 - **시스템 여건도 중요한 변수:** Run7에서 B200 환경, 큰 batch size, GradCache 제거가 추가 향상으로 이어졌다.
 - **베이스 모델도 중요한 레버:** Run8에서 ColQwen3 교체만으로 V1 +0.0696, V2 +0.0454를 달성했다.
 - **2-stage 학습이 현재 가장 강한 레버:** Run9에서 영어 VDR 선행 학습 모델 위에 한국어 데이터를 얹는 방식이, 더 큰 모델로 1-stage 학습하는 것보다 V1/V2 모두에서 우세함을 확인했다.
-- **jina와의 격차가 빠르게 좁혀지고 있음:** V2 Gap이 -0.0223까지 축소됐고, Energy 태스크는 사실상 동률이다.
+- **jina와의 격차가 빠르게 좁혀지고 있음:** V2 Gap이 Run10 기준 -0.0183까지 축소됐다. Run9이 V1 최고, Run10이 V2 최고이며 두 방향 모두 경쟁력 있는 상태.
 
 ## Next Steps
 
-- Qwen3-VL-2B 또는 4B를 베이스로, 공개 영어·다국어 데이터셋(ColPali train set, VisRAG synthetic/in-domain, VDR multilingual 등)으로 Stage 1 학습을 직접 수행한 뒤, 한국어 public/private 데이터로 Stage 2 학습하는 end-to-end 2-stage 파이프라인 구성.
 - 한국어 데이터에 한해 hard negative sampling 도입 후 동일 2-stage 설정으로 재비교.
